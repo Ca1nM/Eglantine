@@ -80,6 +80,14 @@ struct MetadataUpdate {
 
 // Writes an updated NUP container with modified title name and/or icon metadata to a temporary
 // file and atomically replaces the archive when complete.
+// Writes every package of a NUP back out as a loose dump that PackDump accepts: base/,
+// updates/<version>/ and dlc/<titleid>/<n>/, each with exefs/ and romfs/. out_dir must not exist
+// or be empty; it is removed again when the extraction fails or is cancelled.
+PackResult ExtractArchive(const std::filesystem::path& archive, const std::filesystem::path& out_dir,
+                          const std::function<void(const PackProgress&)>& progress = {},
+                          const std::atomic_bool* cancel = nullptr,
+                          std::string* error_out = nullptr);
+
 // progress, if set, is called from the calling thread with the bytes copied so far and the total.
 PackResult UpdateMetadata(const std::filesystem::path& archive, const MetadataUpdate& update,
                           std::string* error_out = nullptr,

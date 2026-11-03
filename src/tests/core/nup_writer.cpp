@@ -584,3 +584,39 @@ TEST_CASE("NUP UpdateMetadata updates title name and icon in metadata", "[nup]")
     REQUIRE(nup.GetPackages()[0].icon == fake_icon);
     REQUIRE(PackedTree(nup.GetRomFSDir(0)) == SourceTree(root / "Base/RomFS"));
 }
+
+TEST_CASE("NUP extracts every package as a loose dump that packs again", "[nup]") {
+    TempDir t;
+    const auto root = t.path / "Game";
+    MakeDump(root);
+    const auto archive = t.path / "Game.nup";
+    FileSys::Nup::PackOptions options{.raw_threshold = 16 * 1024};
+    REQUIRE(FileSys::Nup::PackDump(root, archive, options) == FileSys::Nup::PackResult::Success);
+
+    const auto out = t.path / "out";
+    u64 last_done = 0;
+    std::string error;
+    REQUIRE(FileSys::Nup::ExtractArchive(
+                archive, out,
+                [&](const FileSys::Nup::PackProgress& p) { last_done = p.bytes_done; }, nullptr,
+                &error) == FileSys::Nup::PackResult::Success);
+    INFO(error);
+    REQUIRE(last_done > 0);
+
+    REQUIRE(SourceTree(out / "base/exefs") == SourceTree(root / "Base/ExeFS"));
+    REQUIRE(SourceTree(out / "base/romfs") == SourceTree(root / "Base/RomFS"));
+    REQUIRE(SourceTree(out / "updates/65536/romfs") == SourceTree(root / "updates/65536/romfs"));
+    REQUIRE(SourceTree(out / "updates/131072/exefs") == SourceTree(root / "updates/131072/exefs"));
+    REQUIRE(SourceTree(out / "dlc/0400ABCD00011001/0/romfs") ==
+            SourceTree(root / "dlc/0400ABCD00011001/0/romfs"));
+    REQUIRE(FileSys::Nup::IsLooseDump(out));
+
+    // A non-empty target is refused, and a cancelled run leaves nothing behind.
+    REQUIRE(FileSys::Nup::ExtractArchive(archive, out) ==
+            FileSys::Nup::PackResult::InvalidSource);
+    const auto cancelled_out = t.path / "cancelled";
+    std::atomic_bool cancel{true};
+    REQUIRE(FileSys::Nup::ExtractArchive(archive, cancelled_out, {}, &cancel) ==
+            FileSys::Nup::PackResult::Cancelled);
+    REQUIRE_FALSE(fs::exists(cancelled_out));
+}

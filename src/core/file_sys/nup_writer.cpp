@@ -19,6 +19,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include <fmt/format.h>
 #include <nlohmann/json.hpp>
 #include <openssl/evp.h>
 #include <zstd.h>
@@ -26,6 +27,7 @@
 #include "common/fs/file.h"
 #include "common/fs/path_util.h"
 #include "core/file_sys/control_metadata.h"
+#include "core/file_sys/nup_container.h"
 #include "core/file_sys/vfs/vfs_real.h"
 #include "core/loader/deconstructed_rom_directory.h"
 
@@ -1825,6 +1827,160 @@ PackResult UpdateMetadata(const fs::path& archive, const MetadataUpdate& update,
     if (ec) {
         RemoveFile(temp);
         return fail(PackResult::IoError, "cannot replace NUP archive: " + ec.message());
+    }
+    return PackResult::Success;
+}
+
+namespace {
+
+struct ExtractJob {
+    VirtualFile file;
+    fs::path target;
+};
+
+bool IsSafeName(std::string_view name) {
+    return !name.empty() && name != "." && name != ".." &&
+           name.find_first_of("/\\") == std::string_view::npos &&
+           name.find('\0') == std::string_view::npos;
+}
+
+// Lists the files under dir; false if any name could escape the target folder.
+bool CollectExtractJobs(const VirtualDir& dir, const fs::path& target,
+                        std::vector<ExtractJob>& jobs, std::vector<fs::path>& dirs_out) {
+    if (dir == nullptr) {
+        return true;
+    }
+    dirs_out.push_back(target);
+    for (const auto& file : dir->GetFiles()) {
+        if (!IsSafeName(file->GetName())) {
+            return false;
+        }
+        jobs.push_back({file, target / file->GetName()});
+    }
+    for (const auto& sub : dir->GetSubdirectories()) {
+        if (!IsSafeName(sub->GetName()) ||
+            !CollectExtractJobs(sub, target / sub->GetName(), jobs, dirs_out)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+} // namespace
+
+PackResult ExtractArchive(const fs::path& archive, const fs::path& out_dir,
+                          const std::function<void(const PackProgress&)>& progress,
+                          const std::atomic_bool* cancel, std::string* error_out) {
+    const auto fail = [&](PackResult res, std::string msg) {
+        if (error_out) {
+            *error_out = std::move(msg);
+        }
+        return res;
+    };
+
+    std::error_code ec;
+    if (fs::exists(out_dir, ec) && !fs::is_empty(out_dir, ec)) {
+        return fail(PackResult::InvalidSource, "the target folder is not empty: " + ToUtf8(out_dir));
+    }
+    const bool created_out_dir = !fs::exists(out_dir, ec);
+
+    RealVfsFilesystem real;
+    NupContainer nup{real.OpenFile(ToUtf8(archive), OpenMode::Read)};
+    if (nup.GetStatus() != Loader::ResultStatus::Success) {
+        return fail(PackResult::InvalidSource, "not a valid NUP archive: " + ToUtf8(archive));
+    }
+
+    std::vector<ExtractJob> jobs;
+    std::vector<fs::path> dirs;
+    std::map<u64, u32> addon_index;
+    const auto& packages = nup.GetPackages();
+    for (std::size_t i = 0; i < packages.size(); ++i) {
+        const auto& package = packages[i];
+        fs::path root;
+        switch (package.kind) {
+        case NupContainer::PackageKind::Base:
+            root = out_dir / "base";
+            break;
+        case NupContainer::PackageKind::Update:
+            root = out_dir / "updates" / std::to_string(package.version);
+            break;
+        case NupContainer::PackageKind::Addon:
+            root = out_dir / "dlc" / fmt::format("{:016X}", package.title_id) /
+                   std::to_string(addon_index[package.title_id]++);
+            break;
+        }
+        if (!CollectExtractJobs(nup.GetExeFSDir(i), root / "exefs", jobs, dirs) ||
+            !CollectExtractJobs(nup.GetRomFSDir(i), root / "romfs", jobs, dirs)) {
+            return fail(PackResult::InvalidSource, "the archive contains an invalid file name");
+        }
+    }
+
+    PackProgress state;
+    state.files_total = jobs.size();
+    for (const auto& job : jobs) {
+        state.bytes_total += job.file->GetSize();
+    }
+    const auto space = fs::space(out_dir.has_parent_path() ? out_dir.parent_path() : out_dir, ec);
+    if (!ec && space.available < state.bytes_total) {
+        return fail(PackResult::IoError, "not enough free space to extract the archive");
+    }
+
+    const auto cleanup = [&] {
+        std::error_code remove_ec;
+        if (created_out_dir) {
+            fs::remove_all(out_dir, remove_ec);
+        } else {
+            for (const auto& entry : fs::directory_iterator(out_dir, remove_ec)) {
+                fs::remove_all(entry.path(), remove_ec);
+            }
+        }
+    };
+    const auto abort_with = [&](PackResult res, std::string msg) {
+        cleanup();
+        return fail(res, std::move(msg));
+    };
+
+    fs::create_directories(out_dir, ec);
+    if (ec) {
+        return fail(PackResult::IoError, "cannot create " + ToUtf8(out_dir) + ": " + ec.message());
+    }
+    for (const auto& dir : dirs) {
+        fs::create_directories(dir, ec);
+        if (ec) {
+            return abort_with(PackResult::IoError,
+                              "cannot create " + ToUtf8(dir) + ": " + ec.message());
+        }
+    }
+
+    std::vector<u8> buffer(ReadBufferSize);
+    for (const auto& job : jobs) {
+        Common::FS::IOFile out{job.target, Common::FS::FileAccessMode::Write};
+        if (!out.IsOpen()) {
+            return abort_with(PackResult::IoError, "cannot create " + ToUtf8(job.target));
+        }
+        const u64 size = job.file->GetSize();
+        for (u64 offset = 0; offset < size;) {
+            if (cancel && cancel->load()) {
+                out.Close();
+                cleanup();
+                return PackResult::Cancelled;
+            }
+            const size_t chunk = static_cast<size_t>(std::min<u64>(size - offset, buffer.size()));
+            if (job.file->Read(buffer.data(), chunk, offset) != chunk ||
+                out.WriteSpan(std::span<const u8>{buffer.data(), chunk}) != chunk) {
+                out.Close();
+                return abort_with(PackResult::IoError, "cannot extract " + ToUtf8(job.target));
+            }
+            offset += chunk;
+            state.bytes_done += chunk;
+            if (progress) {
+                progress(state);
+            }
+        }
+        ++state.files_done;
+        if (progress) {
+            progress(state);
+        }
     }
     return PackResult::Success;
 }

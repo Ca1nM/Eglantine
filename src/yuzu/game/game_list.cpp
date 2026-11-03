@@ -481,9 +481,19 @@ void GameList::AddGamePopup(QMenu& context_menu, u64 program_id, const std::stri
     QMenu* play_time_menu = context_menu.addMenu(tr("Manage Play Time"));
     QAction* set_play_time = play_time_menu->addAction(tr("Edit Play Time Data"));
     QAction* remove_play_time_data = play_time_menu->addAction(tr("Remove Play Time Data"));
-    QMenu* dump_romfs_menu = context_menu.addMenu(tr("Dump RomFS"));
-    QAction* dump_romfs = dump_romfs_menu->addAction(tr("Dump RomFS"));
-    QAction* dump_romfs_sdmc = dump_romfs_menu->addAction(tr("Dump RomFS to SDMC"));
+    // A NUP holds loose files already, so it extracts them instead of dumping a RomFS.
+    const bool is_nup_archive =
+        QString::fromStdString(path).endsWith(QStringLiteral(".nup"), Qt::CaseInsensitive);
+    QAction* dump_romfs = nullptr;
+    QAction* dump_romfs_sdmc = nullptr;
+    QAction* extract_nup = nullptr;
+    if (is_nup_archive) {
+        extract_nup = context_menu.addAction(tr("Extract Loose Files..."));
+    } else {
+        QMenu* dump_romfs_menu = context_menu.addMenu(tr("Dump RomFS"));
+        dump_romfs = dump_romfs_menu->addAction(tr("Dump RomFS"));
+        dump_romfs_sdmc = dump_romfs_menu->addAction(tr("Dump RomFS to SDMC"));
+    }
     QAction* verify_integrity = context_menu.addAction(tr("Verify Integrity"));
     QAction* copy_tid = context_menu.addAction(tr("Copy Title ID to Clipboard"));
     QAction* convert_nup = nullptr;
@@ -561,12 +571,19 @@ void GameList::AddGamePopup(QMenu& context_menu, u64 program_id, const std::stri
         emit RemoveFileRequested(program_id, QtCommon::Game::GameListRemoveTarget::CacheStorage,
                                  path);
     });
-    connect(dump_romfs, &QAction::triggered, this, [this, program_id, path]() {
-        emit DumpRomFSRequested(program_id, path, DumpRomFSTarget::Normal);
-    });
-    connect(dump_romfs_sdmc, &QAction::triggered, this, [this, program_id, path]() {
-        emit DumpRomFSRequested(program_id, path, DumpRomFSTarget::SDMC);
-    });
+    if (dump_romfs) {
+        connect(dump_romfs, &QAction::triggered, this, [this, program_id, path]() {
+            emit DumpRomFSRequested(program_id, path, DumpRomFSTarget::Normal);
+        });
+        connect(dump_romfs_sdmc, &QAction::triggered, this, [this, program_id, path]() {
+            emit DumpRomFSRequested(program_id, path, DumpRomFSTarget::SDMC);
+        });
+    }
+    if (extract_nup) {
+        extract_nup->setEnabled(!nup_conversion_running);
+        connect(extract_nup, &QAction::triggered, this,
+                [this, path]() { emit ExtractNupRequested(path); });
+    }
     connect(verify_integrity, &QAction::triggered, this,
             [this, path]() { emit VerifyIntegrityRequested(path); });
     connect(copy_tid, &QAction::triggered, this,

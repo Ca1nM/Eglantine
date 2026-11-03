@@ -1470,6 +1470,7 @@ void MainWindow::ConnectWidgetEvents() {
             &MainWindow::OnGameListVerifyIntegrity);
     connect(game_list, &GameList::ConvertToNupRequested, this,
             &MainWindow::OnGameListConvertToNup);
+    connect(game_list, &GameList::ExtractNupRequested, this, &MainWindow::OnGameListExtractNup);
     connect(game_list, &GameList::CopyTIDRequested, this, &MainWindow::OnGameListCopyTID);
     connect(game_list, &GameList::CreateShortcut, this, &MainWindow::OnGameListCreateShortcut);
     connect(game_list, &GameList::AddDirectory, this, &MainWindow::OnGameListAddDirectory);
@@ -4198,6 +4199,103 @@ void MainWindow::OnGameListConvertToNup(const std::string& game_path) {
                 case FileSys::Nup::PackResult::InvalidSource:
                 case FileSys::Nup::PackResult::IoError:
                     QMessageBox::critical(this, tr("Conversion Failed"),
+                                          QString::fromStdString(error));
+                    break;
+                }
+            },
+            Qt::QueuedConnection);
+        return result;
+    }));
+}
+
+void MainWindow::OnGameListExtractNup(const std::string& game_path) {
+    if (nup_running) {
+        return;
+    }
+    const QString extract_title = tr("Extract Loose Files");
+    const std::filesystem::path archive{Common::FS::ToU8String(game_path)};
+    const QString parent_dir = QtCommon::Frontend::GetExistingDirectory(
+        tr("Choose where to extract the files"),
+        QString::fromStdString(Common::FS::PathToUTF8String(archive.parent_path())));
+    if (parent_dir.isEmpty()) {
+        return;
+    }
+    const auto out_dir =
+        std::filesystem::path{Common::FS::ToU8String(parent_dir.toStdString())} / archive.stem();
+    if (std::filesystem::exists(out_dir) && !std::filesystem::is_empty(out_dir)) {
+        QMessageBox::information(this, extract_title,
+                                 tr("The target folder already exists and is not empty:\n%1")
+                                     .arg(QString::fromStdString(
+                                         Common::FS::PathToUTF8String(out_dir))));
+        return;
+    }
+
+    nup_running = true;
+    nup_source_path = game_path;
+    game_list->SetNupConversionRunning(true);
+    nup_cancel = std::make_shared<std::atomic_bool>(false);
+    nup_progress = new NupProgressDialog(QString::fromStdString(Common::FS::PathToUTF8String(
+                                             archive.stem())),
+                                         QPixmap{}, this);
+    nup_progress->setWindowTitle(extract_title);
+    connect(nup_progress, &NupProgressDialog::CancelRequested, this, [this, cancel = nup_cancel] {
+        cancel->store(true);
+        if (nup_progress) {
+            nup_progress->SetCancelling();
+        }
+    });
+    nup_progress->show();
+
+    const auto cancel = nup_cancel;
+    auto last_update = std::make_shared<std::chrono::steady_clock::time_point>();
+    nup_watcher.setFuture(QtConcurrent::run([this, archive, out_dir, cancel, last_update] {
+        std::string error;
+        FileSys::Nup::PackResult result = FileSys::Nup::PackResult::IoError;
+        try {
+            const auto on_progress = [this, last_update](const FileSys::Nup::PackProgress& p) {
+                const auto now = std::chrono::steady_clock::now();
+                if (now - *last_update < std::chrono::milliseconds(200)) {
+                    return;
+                }
+                *last_update = now;
+                QMetaObject::invokeMethod(
+                    this,
+                    [this, p] {
+                        if (nup_progress) {
+                            nup_progress->SetProgress(p);
+                        }
+                    },
+                    Qt::QueuedConnection);
+            };
+            result = FileSys::Nup::ExtractArchive(archive, out_dir, on_progress, cancel.get(),
+                                                  &error);
+        } catch (const std::exception& e) {
+            error = e.what();
+        }
+        QMetaObject::invokeMethod(
+            this,
+            [this, result, error, out_dir] {
+                nup_running = false;
+                nup_source_path.clear();
+                game_list->SetNupConversionRunning(false);
+                if (nup_progress) {
+                    nup_progress->Finish();
+                    nup_progress->deleteLater();
+                    nup_progress = nullptr;
+                }
+                nup_cancel.reset();
+                switch (result) {
+                case FileSys::Nup::PackResult::Success:
+                    QMessageBox::information(
+                        this, tr("Extraction Complete"),
+                        tr("The loose files were extracted to:\n%1")
+                            .arg(QString::fromStdString(Common::FS::PathToUTF8String(out_dir))));
+                    break;
+                case FileSys::Nup::PackResult::Cancelled:
+                    break;
+                case FileSys::Nup::PackResult::InvalidSource:
+                case FileSys::Nup::PackResult::IoError:
+                    QMessageBox::critical(this, tr("Extraction Failed"),
                                           QString::fromStdString(error));
                     break;
                 }
