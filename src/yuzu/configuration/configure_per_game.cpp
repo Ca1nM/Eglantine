@@ -1015,22 +1015,36 @@ bool ConfigurePerGame::SaveNupMetadata(bool show_error) {
     QWidget* host = isVisible() ? static_cast<QWidget*>(this) : parentWidget();
     QProgressDialog progress(
         tr("Updating the NUP archive...\n\nDo not close the emulator until this has finished."),
-        QString(), 0, 0, host);
+        QString(), 0, 100, host);
     progress.setWindowTitle(tr("Saving NUP Metadata"));
     progress.setWindowModality(Qt::ApplicationModal);
     progress.setCancelButton(nullptr);
     progress.setWindowFlag(Qt::WindowCloseButtonHint, false);
+    progress.setAutoClose(false);
+    progress.setAutoReset(false);
     progress.setMinimumDuration(0);
+    progress.setValue(0);
     progress.show();
+
+    // The worker publishes its progress here; a timer on this thread moves the bar, so the bar
+    // does not depend on style animations.
+    std::atomic<int> percent{0};
+    QTimer ticker;
+    connect(&ticker, &QTimer::timeout, &progress,
+            [&progress, &percent] { progress.setValue(percent.load()); });
+    ticker.start(100);
 
     std::string error;
     QFutureWatcher<FileSys::Nup::PackResult> save_watcher;
     QEventLoop loop;
     connect(&save_watcher, &QFutureWatcher<FileSys::Nup::PackResult>::finished, &loop,
             &QEventLoop::quit);
-    save_watcher.setFuture(QtConcurrent::run([path = file_path, update, &error] {
+    save_watcher.setFuture(QtConcurrent::run([path = file_path, update, &error, &percent] {
         try {
-            return FileSys::Nup::UpdateMetadata(path, update, &error);
+            return FileSys::Nup::UpdateMetadata(
+                path, update, &error, [&percent](u64 done, u64 total) {
+                    percent.store(total == 0 ? 0 : static_cast<int>(done * 100 / total));
+                });
         } catch (const std::exception& e) {
             error = e.what();
             return FileSys::Nup::PackResult::IoError;
@@ -1039,6 +1053,7 @@ bool ConfigurePerGame::SaveNupMetadata(bool show_error) {
     if (!save_watcher.isFinished()) {
         loop.exec(QEventLoop::ExcludeUserInputEvents);
     }
+    ticker.stop();
     progress.close();
     const auto res = save_watcher.result();
     if (res != FileSys::Nup::PackResult::Success) {

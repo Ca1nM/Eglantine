@@ -80,6 +80,8 @@ struct MetadataUpdate {
 
 // Writes an updated NUP container with modified title name and/or icon metadata to a temporary
 // file and atomically replaces the archive when complete.
+// progress, if set, is called from the calling thread with the bytes copied so far and the total.
 PackResult UpdateMetadata(const std::filesystem::path& archive, const MetadataUpdate& update,
-                          std::string* error_out = nullptr);
+                          std::string* error_out = nullptr,
+                          const std::function<void(u64, u64)>& progress = {});
 } // namespace FileSys::Nup

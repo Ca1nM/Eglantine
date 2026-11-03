@@ -1555,7 +1555,7 @@ PackResult PackDump(const fs::path& dump_root, const fs::path& archive, const Pa
 }
 
 PackResult UpdateMetadata(const fs::path& archive, const MetadataUpdate& update,
-                          std::string* error_out) {
+                          std::string* error_out, const std::function<void(u64, u64)>& progress) {
     const auto fail = [&](PackResult res, std::string msg) {
         if (error_out) {
             *error_out = std::move(msg);
@@ -1774,6 +1774,8 @@ PackResult UpdateMetadata(const fs::path& archive, const MetadataUpdate& update,
         }
     }
 
+    const u64 total_copy = (toc_offset - SuperblockSize) + (meta_region_start - toc_offset - toc_size);
+    u64 copied = 0;
     const auto copy_range = [&](u64 start_offset, u64 byte_count) -> bool {
         if (byte_count == 0) {
             return true;
@@ -1781,7 +1783,7 @@ PackResult UpdateMetadata(const fs::path& archive, const MetadataUpdate& update,
         if (!file.Seek(static_cast<s64>(start_offset))) {
             return false;
         }
-        std::vector<u8> copy_buf( static_cast<size_t>(std::min<u64>(byte_count, ReadBufferSize)));
+        std::vector<u8> copy_buf(static_cast<size_t>(std::min<u64>(byte_count, ReadBufferSize)));
         u64 remaining = byte_count;
         while (remaining > 0) {
             const size_t chunk_len = static_cast<size_t>(std::min<u64>(remaining, copy_buf.size()));
@@ -1791,6 +1793,10 @@ PackResult UpdateMetadata(const fs::path& archive, const MetadataUpdate& update,
                 return false;
             }
             remaining -= chunk_len;
+            copied += chunk_len;
+            if (progress) {
+                progress(copied, total_copy);
+            }
         }
         return true;
     };
