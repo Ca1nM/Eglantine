@@ -1596,8 +1596,9 @@ PackResult UpdateMetadata(const fs::path& archive, const MetadataUpdate& update,
     const u64 blob_offset = read_le(super, 0x38, 8);
     const u64 file_size = read_le(super, 0x40, 8);
     const u32 package_count = static_cast<u32>(read_le(super, 0x48, 4));
-    if (file_size != actual_size || toc_offset < SuperblockSize ||
-        blob_offset < toc_offset + toc_size || blob_offset > file_size || package_count == 0) {
+    if (file_size != actual_size || toc_offset < SuperblockSize || toc_size > file_size ||
+        toc_offset > file_size - toc_size || blob_offset < toc_offset + toc_size ||
+        blob_offset > file_size || package_count == 0) {
         return fail(PackResult::InvalidSource, "malformed NUP layout");
     }
 
@@ -1619,6 +1620,11 @@ PackResult UpdateMetadata(const fs::path& archive, const MetadataUpdate& update,
 
     const u64 dir_count = read_le(toc, 0x08, 8);
     const u64 file_count = read_le(toc, 0x10, 8);
+    // Bound the counts by the TOC size first so the size arithmetic below cannot wrap.
+    if (dir_count > toc.size() / DirRecordSize || file_count > toc.size() / FileRecordSize ||
+        package_count > toc.size() / PackageRecordSize) {
+        return fail(PackResult::InvalidSource, "truncated NUP TOC");
+    }
     const u64 needed = TocHeaderSize + static_cast<u64>(package_count) * PackageRecordSize +
                        dir_count * DirRecordSize + file_count * FileRecordSize;
     if (toc.size() < needed) {
@@ -1634,6 +1640,9 @@ PackResult UpdateMetadata(const fs::path& archive, const MetadataUpdate& update,
         const u64 ext_offset = read_le(toc, file_pos + 0x10, 8);
         const u64 ext_size = read_le(toc, file_pos + 0x18, 8);
         if (f_size != 0) {
+            if (ext_offset > file_size || ext_size > file_size - ext_offset) {
+                return fail(PackResult::InvalidSource, "invalid NUP file extent");
+            }
             max_extent_end = std::max(max_extent_end, ext_offset + ext_size);
         }
     }
@@ -1654,7 +1663,8 @@ PackResult UpdateMetadata(const fs::path& archive, const MetadataUpdate& update,
         pkg_metas[i].offset = read_le(toc, pos + 0x20, 8);
         pkg_metas[i].size = static_cast<u32>(read_le(toc, pos + 0x28, 4));
         if (pkg_metas[i].size > 0 && pkg_metas[i].offset != 0) {
-            if (pkg_metas[i].offset + pkg_metas[i].size > file_size) {
+            if (pkg_metas[i].offset > file_size ||
+                pkg_metas[i].size > file_size - pkg_metas[i].offset) {
                 return fail(PackResult::InvalidSource, "invalid NUP package metadata range");
             }
             if (pkg_metas[i].offset < max_extent_end) {
@@ -1754,6 +1764,15 @@ PackResult UpdateMetadata(const fs::path& archive, const MetadataUpdate& update,
         RemoveFile(temp);
         return fail(res, std::move(msg));
     };
+
+    // Keep the original archive's permissions, applied before any data is written.
+    {
+        std::error_code perm_ec;
+        const auto status = fs::status(archive, perm_ec);
+        if (!perm_ec) {
+            fs::permissions(temp, status.permissions(), perm_ec);
+        }
+    }
 
     const auto copy_range = [&](u64 start_offset, u64 byte_count) -> bool {
         if (byte_count == 0) {
