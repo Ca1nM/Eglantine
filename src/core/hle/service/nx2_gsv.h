@@ -2682,6 +2682,18 @@ private:
         std::unique_ptr<Tegra::Host1x::Nx2VideoDecoder> decoder;
         std::vector<Tegra::Host1x::Nx2Picture> pictures;
         std::vector<u8> bytes;
+        // Time spent decoding input and writing output images, logged every 120 output frames, so
+        // a choppy movie shows which half is too slow.
+        using Clock = std::chrono::steady_clock;
+        const auto micros = [](Clock::time_point from) {
+            return static_cast<u64>(
+                std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - from).count());
+        };
+        u64 decode_us{};
+        u64 decode_inputs{};
+        u64 write_us{};
+        u64 write_slowest_us{};
+        u64 timed_frames{};
         std::unique_lock lk{m_mutex};
         while (true) {
             m_cv.wait(lk, [&] {
@@ -2715,7 +2727,12 @@ private:
                 if (fence) {
                     WaitForRelease(*fence);
                 }
+                const auto write_begin = Clock::now();
                 const auto [width, height] = WriteImage(decoder.get(), image, frame, bytes);
+                const u64 write_took = micros(write_begin);
+                write_us += write_took;
+                write_slowest_us = std::max(write_slowest_us, write_took);
+                ++timed_frames;
                 lk.lock();
                 // Even an image written during a flush counts: the client waits for its value.
                 m_outputs.push_back({image, width, height, frame.pts, frame.end});
@@ -2729,6 +2746,15 @@ private:
                     LOG_INFO(Service, "{} frame {} ({}x{}, pts {} us{}) in image {}",
                              GetServiceName(), m_frames_out, width, height, frame.pts,
                              frame.end ? ", end of stream" : "", image);
+                }
+                if (timed_frames >= 120) {
+                    LOG_INFO(Service,
+                             "{} timing over {} frames: write {} us/frame (slowest {} us), decode "
+                             "{} us/input over {} inputs",
+                             GetServiceName(), timed_frames, write_us / timed_frames,
+                             write_slowest_us, decode_inputs != 0 ? decode_us / decode_inputs : 0,
+                             decode_inputs);
+                    decode_us = decode_inputs = write_us = write_slowest_us = timed_frames = 0;
                 }
                 continue;
             }
@@ -2749,10 +2775,13 @@ private:
                 decoder = std::make_unique<Tegra::Host1x::Nx2VideoDecoder>(codec);
             }
             pictures.clear();
+            const auto decode_begin = Clock::now();
             decoder->Decode(input.data, input.pts, pictures);
             if (input.end) {
                 decoder->Drain(pictures);
             }
+            decode_us += micros(decode_begin);
+            ++decode_inputs;
             lk.lock();
             if (m_flush) {
                 continue;

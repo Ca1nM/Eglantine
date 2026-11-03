@@ -17,6 +17,7 @@ extern "C" {
 #pragma GCC diagnostic ignored "-Wconversion"
 #endif
 
+#include <libavutil/opt.h>
 #include <libswscale/swscale.h>
 
 #if defined(__GNUC__) || defined(__clang__)
@@ -92,6 +93,8 @@ struct Nx2VideoDecoder::Impl {
     std::optional<FFmpeg::HardwareContext> hardware;
     std::optional<FFmpeg::DecoderContext> context;
     SwsContext* scaler{};
+    /// What `scaler` was built for: source size and format, destination size and format.
+    std::array<int, 6> scaler_key{};
     bool open{};
     /// Timestamps of submitted frames not yet output. Frames copied back from a host GPU decoder
     /// lose theirs and take the earliest one instead.
@@ -240,10 +243,42 @@ void Nx2VideoDecoder::Render(const Nx2Picture& picture, Nx2PictureFormat format,
         }
         return;
     }
-    impl->scaler = sws_getCachedContext(impl->scaler, f->width, f->height,
-                                        static_cast<AVPixelFormat>(f->format),
-                                        static_cast<int>(width), static_cast<int>(height), target,
-                                        SWS_BILINEAR, nullptr, nullptr, nullptr);
+    // The colour conversion runs on every frame of a movie on the decode thread, so it uses all
+    // cores (swscale's "threads" option, 0 = automatic) instead of one. The context is rebuilt only
+    // when the source or destination changes; if the threaded build fails, the single-threaded
+    // one is used as before.
+    const std::array<int, 6> key{f->width,
+                                 f->height,
+                                 f->format,
+                                 static_cast<int>(width),
+                                 static_cast<int>(height),
+                                 static_cast<int>(target)};
+    if (impl->scaler == nullptr || impl->scaler_key != key) {
+        sws_freeContext(impl->scaler);
+        impl->scaler = nullptr;
+        if (SwsContext* const threaded = sws_alloc_context()) {
+            av_opt_set_int(threaded, "srcw", f->width, 0);
+            av_opt_set_int(threaded, "srch", f->height, 0);
+            av_opt_set_int(threaded, "src_format", f->format, 0);
+            av_opt_set_int(threaded, "dstw", static_cast<int64_t>(width), 0);
+            av_opt_set_int(threaded, "dsth", static_cast<int64_t>(height), 0);
+            av_opt_set_int(threaded, "dst_format", static_cast<int64_t>(target), 0);
+            av_opt_set_int(threaded, "sws_flags", SWS_BILINEAR, 0);
+            av_opt_set_int(threaded, "threads", 0, 0);
+            if (sws_init_context(threaded, nullptr, nullptr) >= 0) {
+                impl->scaler = threaded;
+            } else {
+                sws_freeContext(threaded);
+            }
+        }
+        if (impl->scaler == nullptr) {
+            impl->scaler = sws_getCachedContext(nullptr, f->width, f->height,
+                                                static_cast<AVPixelFormat>(f->format),
+                                                static_cast<int>(width), static_cast<int>(height),
+                                                target, SWS_BILINEAR, nullptr, nullptr, nullptr);
+        }
+        impl->scaler_key = key;
+    }
     if (impl->scaler == nullptr) {
         LOG_ERROR(HW_GPU, "nx2 video: cannot convert {} to {}",
                   av_get_pix_fmt_name(static_cast<AVPixelFormat>(f->format)),
