@@ -5,11 +5,12 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cctype>
 #include <filesystem>
 #include <memory>
 #include <optional>
-#include <regex>
 #include <set>
 #include <string>
 #include <unordered_map>
@@ -25,15 +26,22 @@
 #include <QBuffer>
 #include <QByteArray>
 #include <QCheckBox>
+#include <QDialog>
+#include <QDialogButtonBox>
+#include <QEventLoop>
 #include <QFileInfo>
 #include <QIcon>
 #include <QImage>
+#include <QLabel>
 #include <QLineEdit>
+#include <QListWidget>
 #include <QMessageBox>
+#include <QProgressDialog>
 #include <QPushButton>
 #include <QStandardPaths>
 #include <QString>
 #include <QTimer>
+#include <QVBoxLayout>
 #include <QtConcurrent/QtConcurrentRun>
 
 #include "common/fs/fs_util.h"
@@ -76,6 +84,9 @@
 namespace {
 
 constexpr int IconTargetSize = 256;
+constexpr int MinCandidateScore = 300;
+constexpr std::size_t MaxIconDownloads = 3;
+constexpr std::size_t MaxSgdbChoices = 8;
 
 std::vector<u8> EncodeSquareIcon(const QImage& source) {
     if (source.isNull()) {
@@ -183,38 +194,171 @@ std::string UrlEncode(std::string_view value) {
     return out;
 }
 
-std::optional<std::string> HttpGetUrl(const std::string& full_url, int timeout_sec = 8) {
-    const auto scheme_end = full_url.find("://");
-    if (scheme_end == std::string::npos) {
-        return std::nullopt;
+constexpr std::chrono::seconds DetectIconDeadline{10};
+constexpr std::size_t MaxHttpBodySize = 4 * 1024 * 1024;
+constexpr std::chrono::seconds PrimarySourceDeadline{5};
+constexpr std::string_view IconSiteHost = "https://switchiconshowdown.com";
+constexpr std::string_view SgdbApiBase = "https://www.steamgriddb.com/api/v2";
+
+bool IsAllowedIconHost(std::string_view host) {
+    return host == "switchiconshowdown.com" || host == "steamgriddb.com" ||
+           host.ends_with(".steamgriddb.com");
+}
+
+enum class HttpStatus { Ok, NetworkError, Timeout, Cancelled, Unauthorized };
+
+struct HttpResult {
+    HttpStatus status{HttpStatus::NetworkError};
+    std::string body;
+    std::string detail;
+};
+
+// Every request shares one deadline and cancel flag, so a whole search can never run past it.
+HttpResult HttpGet(const std::string& full_url, std::chrono::steady_clock::time_point deadline,
+                   const std::atomic_bool& cancel, const std::string& bearer_token = {}) {
+    using namespace std::chrono;
+    HttpResult result;
+    if (cancel) {
+        result.status = HttpStatus::Cancelled;
+        return result;
     }
-    const auto path_start = full_url.find('/', scheme_end + 3);
-    const std::string host =
+    constexpr std::string_view scheme = "https://";
+    if (!full_url.starts_with(scheme)) {
+        result.detail = "unsupported URL";
+        return result;
+    }
+    const auto path_start = full_url.find('/', scheme.size());
+    const std::string origin =
         path_start == std::string::npos ? full_url : full_url.substr(0, path_start);
     const std::string path =
         path_start == std::string::npos ? std::string{"/"} : full_url.substr(path_start);
+    if (!IsAllowedIconHost(std::string_view{origin}.substr(scheme.size()))) {
+        result.detail = "unexpected host";
+        return result;
+    }
+    const auto remaining = duration_cast<milliseconds>(deadline - steady_clock::now());
+    if (remaining.count() <= 0) {
+        result.status = HttpStatus::Timeout;
+        return result;
+    }
     try {
-        httplib::Client client(host);
-        client.set_connection_timeout(timeout_sec);
-        client.set_read_timeout(timeout_sec);
-        client.set_write_timeout(timeout_sec);
+        httplib::Client client(origin);
+        client.set_connection_timeout(remaining);
+        client.set_read_timeout(remaining);
+        client.set_write_timeout(remaining);
+        client.set_max_timeout(remaining);
         client.set_follow_location(true);
 #ifdef YUZU_BUNDLED_OPENSSL
         client.load_ca_cert_store(kCert, sizeof(kCert));
 #endif
-        httplib::Headers headers{
-            {"User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                           "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"},
-        };
-        auto res = client.Get(path, headers);
-        if (!res || res->status != 200 || res->body.empty()) {
-            return std::nullopt;
+        httplib::Headers headers{{"User-Agent", "Eglantine"}};
+        if (!bearer_token.empty()) {
+            headers.emplace("Authorization", "Bearer " + bearer_token);
         }
-        return std::move(res->body);
+        auto res = client.Get(path, headers);
+        if (!res) {
+            result.status = res.error() == httplib::Error::Canceled || steady_clock::now() >= deadline
+                                ? HttpStatus::Timeout
+                                : HttpStatus::NetworkError;
+            result.detail = httplib::to_string(res.error());
+            return result;
+        }
+        if (res->status != 200) {
+            result.status = res->status == 401 || res->status == 403 ? HttpStatus::Unauthorized
+                                                                      : HttpStatus::NetworkError;
+            result.detail = fmt::format("HTTP {}", res->status);
+            return result;
+        }
+        if (res->body.empty() || res->body.size() > MaxHttpBodySize) {
+            result.detail = "unexpected response size";
+            return result;
+        }
+        result.status = HttpStatus::Ok;
+        result.body = std::move(res->body);
     } catch (const std::exception& e) {
-        LOG_WARNING(Frontend, "HTTP GET failed for {}: {}", full_url, e.what());
-        return std::nullopt;
+        result.detail = e.what();
+    } catch (...) {
+        result.detail = "unknown error";
     }
+    return result;
+}
+
+struct IconCandidate {
+    int id{};
+    std::string title;
+};
+
+std::string DecodeHtmlEntities(std::string text) {
+    static constexpr std::pair<std::string_view, std::string_view> entities[]{
+        {"&amp;", "&"},  {"&lt;", "<"},     {"&gt;", ">"},     {"&quot;", "\""},
+        {"&#039;", "'"}, {"&#39;", "'"},    {"&apos;", "'"},   {"&eacute;", "\xC3\xA9"},
+    };
+    for (const auto& [from, to] : entities) {
+        boost::replace_all(text, from, to);
+    }
+    return text;
+}
+
+// Rows look like: <a href='./detail.php?id=N'><img ...></a></td><td><center>Title</center>
+std::vector<IconCandidate> ParseSearchResults(const std::string& html) {
+    constexpr std::string_view id_marker = "detail.php?id=";
+    constexpr std::string_view title_marker = "<td><center>";
+    std::vector<IconCandidate> out;
+    std::size_t pos = 0;
+    while (out.size() < 16) {
+        const auto id_pos = html.find(id_marker, pos);
+        if (id_pos == std::string::npos) {
+            break;
+        }
+        pos = id_pos + id_marker.size();
+        const auto id_end = html.find_first_not_of("0123456789", pos);
+        const auto digits = html.substr(pos, id_end == std::string::npos ? id_end : id_end - pos);
+        if (digits.empty() || digits.size() > 9) {
+            continue;
+        }
+        const auto title_pos = html.find(title_marker, pos);
+        if (title_pos == std::string::npos) {
+            break;
+        }
+        const auto title_begin = title_pos + title_marker.size();
+        const auto title_end = html.find("</center>", title_begin);
+        if (title_end == std::string::npos) {
+            break;
+        }
+        auto title = DecodeHtmlEntities(html.substr(title_begin, title_end - title_begin));
+        if (title.find('<') == std::string::npos && !title.empty()) {
+            out.push_back({std::stoi(digits), std::move(title)});
+        }
+        pos = title_end;
+    }
+    return out;
+}
+
+std::string UrlEncodePathSegment(std::string value) {
+    std::ranges::replace(value, '/', ' ');
+    std::ranges::replace(value, '\\', ' ');
+    auto encoded = UrlEncode(value);
+    boost::replace_all(encoded, "+", "%20");
+    return encoded;
+}
+
+// Icon image URLs from a SteamGridDB response, best size first.
+std::vector<std::string> ParseSgdbIconUrls(const std::string& body) {
+    std::vector<std::string> urls;
+    const auto json = nlohmann::json::parse(body, nullptr, false);
+    if (json.is_discarded() || !json.is_object() || !json.contains("data") ||
+        !json["data"].is_array()) {
+        return urls;
+    }
+    for (const auto& item : json["data"]) {
+        if (urls.size() >= MaxSgdbChoices) {
+            break;
+        }
+        if (item.is_object() && item.contains("url") && item["url"].is_string()) {
+            urls.push_back(item["url"].get<std::string>());
+        }
+    }
+    return urls;
 }
 
 int ScoreCandidateTitle(const std::string& candidate, const std::string& query) {
@@ -324,11 +468,8 @@ ConfigurePerGame::ConfigurePerGame(QWidget* parent, u64 title_id_, const std::st
             &ConfigurePerGame::OnUploadNupIcon);
     connect(ui->button_detect_icon, &QPushButton::clicked, this,
             &ConfigurePerGame::OnDetectNupIcon);
-    connect(ui->display_name, &QLineEdit::editingFinished, this, [this] {
-        if (is_nup_file) {
-            SaveNupMetadata(true);
-        }
-    });
+    connect(&detect_watcher, &QFutureWatcher<DetectIconResult>::finished, this,
+            &ConfigurePerGame::OnDetectNupIconFinished);
 
     if (system.IsPoweredOn()) {
         QPushButton* apply_button = ui->buttonBox->addButton(QDialogButtonBox::Apply);
@@ -340,10 +481,12 @@ ConfigurePerGame::ConfigurePerGame(QWidget* parent, u64 title_id_, const std::st
 }
 
 ConfigurePerGame::~ConfigurePerGame() {
-    detect_watcher.waitForFinished();
+    // Never block the UI thread: the detached worker stops on its own once it sees the flag.
+    detect_cancel->store(true);
 }
 
 void ConfigurePerGame::ApplyConfiguration() {
+    // Name and icon edits are written once, when the dialog is applied.
     SaveNupMetadata(true);
 
     for (const auto tab : *tab_group) {
@@ -503,7 +646,6 @@ void ConfigurePerGame::OnUploadNupIcon() {
         UpdateIconPreview(map);
     }
     nup_icon_modified = true;
-    SaveNupMetadata(true);
 }
 
 void ConfigurePerGame::OnDetectNupIcon() {
@@ -524,198 +666,332 @@ void ConfigurePerGame::OnDetectNupIcon() {
     ui->button_detect_icon->setEnabled(false);
     ui->button_detect_icon->setText(tr("Detecting..."));
 
-    const auto nup_path = file_path;
+    detect_cancel->store(false);
     const u64 tid = title_id;
-    detect_watcher.setFuture(QtConcurrent::run([this, raw_query, tid, nup_path] {
+    const std::string api_key = UISettings::values.steamgriddb_api_key.GetValue();
+    // The worker captures no pointer to this dialog, so it may safely outlive it.
+    detect_watcher.setFuture(QtConcurrent::run([raw_query, tid, api_key,
+                                                cancel = detect_cancel] {
+        using namespace std::chrono;
         DetectIconResult out;
-        const std::string search_name = ResolveGameNameAlias(raw_query, tid);
-        if (search_name != raw_query) {
-            out.resolved_title = search_name;
-        }
-        const std::string slug = NormalizeGameSlug(search_name);
-
-        const auto try_decode_bytes = [&](std::string_view bytes) -> bool {
-            if (bytes.empty()) {
-                return false;
+        try {
+            const auto start = steady_clock::now();
+            const auto deadline = start + DetectIconDeadline;
+            const std::string search_name = ResolveGameNameAlias(raw_query, tid);
+            if (search_name != raw_query) {
+                out.resolved_title = search_name;
             }
-            QImage img;
-            if (!img.loadFromData(reinterpret_cast<const uchar*>(bytes.data()),
-                                  static_cast<int>(bytes.size()))) {
-                return false;
+            if (search_name.empty()) {
+                out.status = DetectIconStatus::NotFound;
+                return out;
             }
-            out.icon_bytes = EncodeSquareIcon(img);
-            return !out.icon_bytes.empty();
-        };
 
-        // 1. Check local image files next to the NUP archive
-        if (!nup_path.empty() && nup_path.has_parent_path()) {
-            const auto dir = nup_path.parent_path();
-            const auto stem = Common::FS::PathToUTF8String(nup_path.stem());
-            for (const auto& base : {slug, stem, std::string{"icon"}}) {
-                if (base.empty()) {
-                    continue;
+            const auto to_status = [](const HttpResult& res) {
+                switch (res.status) {
+                case HttpStatus::Timeout:
+                    return DetectIconStatus::Timeout;
+                case HttpStatus::Cancelled:
+                    return DetectIconStatus::Cancelled;
+                case HttpStatus::Unauthorized:
+                    return DetectIconStatus::BadApiKey;
+                default:
+                    return DetectIconStatus::NetworkError;
                 }
-                for (const char* ext : {".png", ".jpg", ".jpeg", ".webp"}) {
-                    const auto candidate = dir / (base + ext);
-                    std::error_code ec;
-                    if (std::filesystem::is_regular_file(candidate, ec)) {
-                        QImage img(QString::fromStdString(Common::FS::PathToUTF8String(candidate)));
-                        if (!img.isNull()) {
-                            out.icon_bytes = EncodeSquareIcon(img);
-                            if (!out.icon_bytes.empty()) {
-                                QMetaObject::invokeMethod(
-                                    this, [this, out] {
-                                        ui->button_detect_icon->setEnabled(true);
-                                        ui->button_detect_icon->setText(tr("Detect Icon"));
-                                        if (!out.resolved_title.empty()) {
-                                            ui->display_name->setText(
-                                                QString::fromStdString(out.resolved_title));
-                                        }
-                                        QPixmap map;
-                                        if (map.loadFromData(
-                                                out.icon_bytes.data(),
-                                                static_cast<u32>(out.icon_bytes.size()))) {
-                                            UpdateIconPreview(map);
-                                        }
-                                        pending_nup_icon = out.icon_bytes;
-                                        nup_icon_modified = true;
-                                        SaveNupMetadata(true);
-                                    },
-                                    Qt::QueuedConnection);
-                                return out;
-                            }
+            };
+            const auto decode_icon = [&out](const std::string& body) {
+                QImage img;
+                if (img.loadFromData(reinterpret_cast<const uchar*>(body.data()),
+                                     static_cast<int>(body.size()))) {
+                    out.icon_bytes = EncodeSquareIcon(img);
+                }
+                return !out.icon_bytes.empty();
+            };
+
+            // Primary: switchiconshowdown.com, limited so the fallback keeps some of the time.
+            DetectIconStatus primary = DetectIconStatus::NotFound;
+            std::string primary_error;
+            const auto primary_deadline = std::min(deadline, start + PrimarySourceDeadline);
+            do {
+                std::vector<std::string> queries{search_name};
+                if (const auto colon = search_name.find(':');
+                    colon != std::string::npos && colon > 0) {
+                    queries.push_back(search_name.substr(0, colon));
+                }
+                std::vector<IconCandidate> candidates;
+                for (const auto& query : queries) {
+                    const auto res =
+                        HttpGet(std::string{IconSiteHost} + "/search.php?query=" + UrlEncode(query),
+                                primary_deadline, *cancel);
+                    if (res.status != HttpStatus::Ok) {
+                        primary = to_status(res);
+                        primary_error = res.detail;
+                        break;
+                    }
+                    candidates = ParseSearchResults(res.body);
+                    if (!candidates.empty()) {
+                        break;
+                    }
+                }
+                if (primary != DetectIconStatus::NotFound) {
+                    break;
+                }
+
+                // The site can list one game several times; keep the closest title first.
+                std::vector<std::pair<int, IconCandidate>> scored;
+                for (auto& cand : candidates) {
+                    const int score = ScoreCandidateTitle(cand.title, search_name);
+                    if (score >= MinCandidateScore) {
+                        scored.emplace_back(score, std::move(cand));
+                    }
+                }
+                std::ranges::stable_sort(
+                    scored, [](const auto& a, const auto& b) { return a.first > b.first; });
+                for (std::size_t i = 0; i < scored.size() && i < MaxIconDownloads; ++i) {
+                    const auto res = HttpGet(fmt::format("{}/images/100/{}.png", IconSiteHost,
+                                                         scored[i].second.id),
+                                             primary_deadline, *cancel);
+                    if (res.status != HttpStatus::Ok) {
+                        primary = to_status(res);
+                        primary_error = res.detail;
+                        break;
+                    }
+                    if (decode_icon(res.body)) {
+                        out.status = DetectIconStatus::Found;
+                        return out;
+                    }
+                }
+            } while (false);
+
+            if (primary == DetectIconStatus::Cancelled) {
+                out.status = primary;
+                return out;
+            }
+
+            // Fallback: SteamGridDB, which needs the user's API key.
+            if (api_key.empty()) {
+                out.status = primary == DetectIconStatus::NotFound ? DetectIconStatus::NeedsApiKey
+                                                                   : primary;
+                out.error = primary_error;
+                return out;
+            }
+            const auto sgdb_get = [&](const std::string& path) {
+                return HttpGet(std::string{SgdbApiBase} + path, deadline, *cancel, api_key);
+            };
+            const auto search = sgdb_get("/search/autocomplete/" + UrlEncodePathSegment(search_name));
+            if (search.status != HttpStatus::Ok) {
+                out.status = to_status(search);
+                out.error = search.detail;
+                return out;
+            }
+            const auto parsed = nlohmann::json::parse(search.body, nullptr, false);
+            int game_id = 0;
+            if (!parsed.is_discarded() && parsed.is_object() && parsed.contains("data") &&
+                parsed["data"].is_array() && !parsed["data"].empty() &&
+                parsed["data"][0].is_object() && parsed["data"][0].contains("id") &&
+                parsed["data"][0]["id"].is_number_integer()) {
+                game_id = parsed["data"][0]["id"].get<int>();
+            }
+            if (game_id <= 0) {
+                out.status = DetectIconStatus::NotFound;
+                return out;
+            }
+            const auto icons =
+                sgdb_get(fmt::format("/icons/game/{}?dimensions=256,512&mimes=image/png", game_id));
+            if (icons.status != HttpStatus::Ok) {
+                out.status = to_status(icons);
+                out.error = icons.detail;
+                return out;
+            }
+            // Collect every icon that arrives in time; the user picks one.
+            for (const auto& url : ParseSgdbIconUrls(icons.body)) {
+                const auto img = HttpGet(url, deadline, *cancel);
+                if (img.status != HttpStatus::Ok) {
+                    if (img.status == HttpStatus::Cancelled || img.status == HttpStatus::Timeout) {
+                        if (out.choices.empty()) {
+                            out.status = to_status(img);
+                            out.error = img.detail;
+                            return out;
                         }
-                    }
-                }
-            }
-        }
-
-        // 2. Check Eden official boxart repository
-        if (!slug.empty()) {
-            std::vector<std::string> candidate_slugs{slug};
-            if (!slug.starts_with("the-legend-of-")) {
-                candidate_slugs.push_back("the-legend-of-" + slug);
-            }
-            if (!slug.starts_with("super-")) {
-                candidate_slugs.push_back("super-" + slug);
-            }
-            for (const auto& s : candidate_slugs) {
-                const auto url = fmt::format(
-                    "https://raw.githubusercontent.com/eden-emulator/boxart/refs/heads/master/img/{}.png",
-                    s);
-                if (const auto body = HttpGetUrl(url); body && try_decode_bytes(*body)) {
-                    break;
-                }
-            }
-        }
-
-        // 3. Query Wikipedia pageimages API (handles Switch & Switch 2 games)
-        if (out.icon_bytes.empty() && !search_name.empty()) {
-            for (const auto& suffix : {" video game", " Nintendo", ""}) {
-                const std::string api_url = fmt::format(
-                    "https://en.wikipedia.org/w/api.php?action=query&format=json&generator=search"
-                    "&gsrsearch={}&gsrlimit=8&prop=pageimages&piprop=thumbnail|original"
-                    "&pithumbsize=512&pilicense=any",
-                    UrlEncode(search_name + suffix));
-                const auto json_body = HttpGetUrl(api_url);
-                if (!json_body) {
-                    continue;
-                }
-                const auto parsed = nlohmann::json::parse(*json_body, nullptr, false);
-                if (parsed.is_discarded() || !parsed.contains("query") ||
-                    !parsed["query"].contains("pages")) {
-                    continue;
-                }
-                struct WikiCandidate {
-                    int score{};
-                    int index{};
-                    std::string title;
-                    std::string img_url;
-                };
-                std::vector<WikiCandidate> candidates;
-                for (const auto& [_, page] : parsed["query"]["pages"].items()) {
-                    std::string img_url;
-                    if (page.contains("thumbnail") && page["thumbnail"].contains("source") &&
-                        page["thumbnail"]["source"].is_string()) {
-                        img_url = page["thumbnail"]["source"].get<std::string>();
-                    } else if (page.contains("original") && page["original"].contains("source") &&
-                               page["original"]["source"].is_string()) {
-                        img_url = page["original"]["source"].get<std::string>();
-                    }
-                    if (img_url.empty()) {
-                        continue;
-                    }
-                    const std::string page_title = page.value("title", std::string{});
-                    const int page_index = page.value("index", 99);
-                    candidates.push_back({ScoreCandidateTitle(page_title, search_name), page_index,
-                                          page_title, std::move(img_url)});
-                }
-                std::ranges::sort(candidates, [](const WikiCandidate& a, const WikiCandidate& b) {
-                    if (a.score != b.score) {
-                        return a.score > b.score;
-                    }
-                    return a.index < b.index;
-                });
-                for (const auto& cand : candidates) {
-                    if (const auto img_body = HttpGetUrl(cand.img_url);
-                        img_body && try_decode_bytes(*img_body)) {
                         break;
                     }
+                    continue;
                 }
-                if (!out.icon_bytes.empty()) {
-                    break;
-                }
-            }
-        }
-
-        // 4. Fallback to Bing square game icon thumbnail search
-        if (out.icon_bytes.empty() && !search_name.empty()) {
-            const std::string bing_url = fmt::format(
-                "https://www.bing.com/images/search?q={}&qft=+filterui:aspect-square",
-                UrlEncode(search_name + " nintendo switch game icon cover"));
-            if (const auto html = HttpGetUrl(bing_url)) {
-                static const std::regex thumb_re(
-                    R"(https://(?:tse[0-9]\.mm|th)\.bing\.com/th/id/OIP\.[A-Za-z0-9_\-]+)");
-                for (std::sregex_iterator it(html->begin(), html->end(), thumb_re), end; it != end;
-                     ++it) {
-                    const std::string thumb_url = it->str() + "?w=256&h=256&c=7";
-                    if (const auto img_body = HttpGetUrl(thumb_url);
-                        img_body && try_decode_bytes(*img_body)) {
-                        break;
-                    }
+                if (decode_icon(img.body)) {
+                    out.choices.push_back(std::move(out.icon_bytes));
+                    out.icon_bytes.clear();
                 }
             }
+            if (!out.choices.empty()) {
+                out.status = DetectIconStatus::Choices;
+                return out;
+            }
+            out.status = DetectIconStatus::NotFound;
+        } catch (const std::exception& e) {
+            out.status = DetectIconStatus::InternalError;
+            out.error = e.what();
+        } catch (...) {
+            out.status = DetectIconStatus::InternalError;
+            out.error = "unknown error";
         }
-
-        if (out.icon_bytes.empty()) {
-            out.error = fmt::format("Could not find a matching icon for \"{}\".", search_name);
-        }
-
-        QMetaObject::invokeMethod(
-            this,
-            [this, out] {
-                ui->button_detect_icon->setEnabled(true);
-                ui->button_detect_icon->setText(tr("Detect Icon"));
-                if (out.icon_bytes.empty()) {
-                    QMessageBox::information(this, tr("Detect Icon"),
-                                             QString::fromStdString(out.error));
-                    return;
-                }
-                if (!out.resolved_title.empty()) {
-                    ui->display_name->setText(QString::fromStdString(out.resolved_title));
-                }
-                QPixmap map;
-                if (map.loadFromData(out.icon_bytes.data(),
-                                     static_cast<u32>(out.icon_bytes.size()))) {
-                    UpdateIconPreview(map);
-                }
-                pending_nup_icon = out.icon_bytes;
-                nup_icon_modified = true;
-                SaveNupMetadata(true);
-            },
-            Qt::QueuedConnection);
         return out;
     }));
+}
+
+int ConfigurePerGame::ChooseIcon(const std::vector<std::vector<u8>>& choices) {
+    if (choices.size() == 1) {
+        return 0;
+    }
+    QDialog dialog(this);
+    dialog.setWindowTitle(tr("Choose an Icon"));
+    auto* layout = new QVBoxLayout(&dialog);
+    layout->addWidget(new QLabel(tr("SteamGridDB has several icons for this game. Pick one:"),
+                                 &dialog));
+    auto* list = new QListWidget(&dialog);
+    list->setViewMode(QListView::IconMode);
+    list->setIconSize(QSize(128, 128));
+    list->setResizeMode(QListView::Adjust);
+    list->setMovement(QListView::Static);
+    list->setSpacing(8);
+    list->setSelectionMode(QAbstractItemView::SingleSelection);
+    for (std::size_t i = 0; i < choices.size(); ++i) {
+        QPixmap map;
+        if (map.loadFromData(choices[i].data(), static_cast<u32>(choices[i].size()))) {
+            auto* item = new QListWidgetItem(QIcon(map), QString::number(i + 1));
+            item->setData(Qt::UserRole, static_cast<int>(i));
+            list->addItem(item);
+        }
+    }
+    if (list->count() == 0) {
+        return -1;
+    }
+    list->setCurrentRow(0);
+    auto* buttons =
+        new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+    connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    connect(list, &QListWidget::itemDoubleClicked, &dialog, &QDialog::accept);
+    layout->addWidget(list);
+    layout->addWidget(buttons);
+    dialog.resize(520, 420);
+    if (dialog.exec() != QDialog::Accepted || list->currentItem() == nullptr) {
+        return -1;
+    }
+    return list->currentItem()->data(Qt::UserRole).toInt();
+}
+
+void ConfigurePerGame::OnDetectNupIconFinished() {
+    ui->button_detect_icon->setEnabled(true);
+    ui->button_detect_icon->setText(tr("Detect Icon"));
+
+    DetectIconResult result;
+    try {
+        result = detect_watcher.result();
+    } catch (const std::exception& e) {
+        result.status = DetectIconStatus::InternalError;
+        result.error = e.what();
+    } catch (...) {
+        result.status = DetectIconStatus::InternalError;
+    }
+
+    QString message;
+    switch (result.status) {
+    case DetectIconStatus::Found: {
+        QPixmap map;
+        if (!map.loadFromData(result.icon_bytes.data(),
+                              static_cast<u32>(result.icon_bytes.size()))) {
+            message = tr("The downloaded icon could not be displayed.");
+            break;
+        }
+        if (!result.resolved_title.empty()) {
+            ui->display_name->setText(QString::fromStdString(result.resolved_title));
+        }
+        UpdateIconPreview(map);
+        pending_nup_icon = std::move(result.icon_bytes);
+        nup_icon_modified = true;
+        return;
+    }
+    case DetectIconStatus::Choices: {
+        const int index = ChooseIcon(result.choices);
+        if (index < 0) {
+            return;
+        }
+        QPixmap map;
+        if (!map.loadFromData(result.choices[index].data(),
+                              static_cast<u32>(result.choices[index].size()))) {
+            message = tr("The selected icon could not be displayed.");
+            break;
+        }
+        if (!result.resolved_title.empty()) {
+            ui->display_name->setText(QString::fromStdString(result.resolved_title));
+        }
+        UpdateIconPreview(map);
+        pending_nup_icon = std::move(result.choices[index]);
+        nup_icon_modified = true;
+        return;
+    }
+    case DetectIconStatus::NotFound:
+        message = tr("No matching icon was found on switchiconshowdown.com or SteamGridDB. Try a "
+                     "different game name or upload an icon.");
+        break;
+    case DetectIconStatus::NeedsApiKey:
+    case DetectIconStatus::BadApiKey: {
+        const bool missing = result.status == DetectIconStatus::NeedsApiKey;
+        QString text =
+            missing ? tr("No matching icon was found on switchiconshowdown.com. A SteamGridDB API "
+                         "key enables a fallback search.")
+                    : tr("SteamGridDB rejected the saved API key.");
+        if (UISettings::values.steamgriddb_api_key.GetValue().empty()) {
+            text += QStringLiteral("<br><br>") +
+                    tr("Create a free key on the <a href=\"%1\">SteamGridDB API preferences</a> "
+                       "page.")
+                        .arg(QStringLiteral("https://www.steamgriddb.com/profile/preferences/api"));
+        }
+        QDialog key_dialog(this);
+        key_dialog.setWindowTitle(tr("SteamGridDB API Key"));
+        auto* layout = new QVBoxLayout(&key_dialog);
+        auto* label = new QLabel(text, &key_dialog);
+        label->setTextFormat(Qt::RichText);
+        label->setOpenExternalLinks(true);
+        label->setWordWrap(true);
+        auto* key_edit = new QLineEdit(
+            QString::fromStdString(UISettings::values.steamgriddb_api_key.GetValue()),
+            &key_dialog);
+        key_edit->setEchoMode(QLineEdit::Password);
+        key_edit->setPlaceholderText(tr("API key"));
+        auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel,
+                                             &key_dialog);
+        connect(buttons, &QDialogButtonBox::accepted, &key_dialog, &QDialog::accept);
+        connect(buttons, &QDialogButtonBox::rejected, &key_dialog, &QDialog::reject);
+        layout->addWidget(label);
+        layout->addWidget(key_edit);
+        layout->addWidget(buttons);
+        key_dialog.setMinimumWidth(420);
+        if (key_dialog.exec() == QDialog::Accepted && !key_edit->text().trimmed().isEmpty()) {
+            UISettings::values.steamgriddb_api_key.SetValue(
+                key_edit->text().trimmed().toStdString());
+            OnDetectNupIcon();
+        }
+        return;
+    }
+    case DetectIconStatus::Timeout:
+        message = tr("Icon detection took longer than %1 seconds and was stopped. Check your "
+                     "connection and try again.")
+                      .arg(DetectIconDeadline.count());
+        break;
+    case DetectIconStatus::NetworkError:
+        message = tr("Could not reach switchiconshowdown.com (%1). Check your connection and try "
+                     "again.")
+                      .arg(QString::fromStdString(result.error));
+        break;
+    case DetectIconStatus::Cancelled:
+        return;
+    case DetectIconStatus::InternalError:
+        message = tr("Icon detection failed unexpectedly: %1")
+                      .arg(QString::fromStdString(result.error));
+        break;
+    }
+    LOG_WARNING(Frontend, "Icon detection failed: {}", message.toStdString());
+    QMessageBox::warning(this, tr("Detect Icon"), message);
 }
 
 bool ConfigurePerGame::SaveNupMetadata(bool show_error) {
@@ -734,8 +1010,37 @@ bool ConfigurePerGame::SaveNupMetadata(bool show_error) {
     if (nup_icon_modified) {
         update.icon = pending_nup_icon;
     }
+    // The archive is rewritten, which takes a while for large games. By the time OK is handled
+    // the properties window may already be closed, so the popup falls back to its parent.
+    QWidget* host = isVisible() ? static_cast<QWidget*>(this) : parentWidget();
+    QProgressDialog progress(
+        tr("Updating the NUP archive...\n\nDo not close the emulator until this has finished."),
+        QString(), 0, 0, host);
+    progress.setWindowTitle(tr("Saving NUP Metadata"));
+    progress.setWindowModality(Qt::ApplicationModal);
+    progress.setCancelButton(nullptr);
+    progress.setWindowFlag(Qt::WindowCloseButtonHint, false);
+    progress.setMinimumDuration(0);
+    progress.show();
+
     std::string error;
-    const auto res = FileSys::Nup::UpdateMetadata(file_path, update, &error);
+    QFutureWatcher<FileSys::Nup::PackResult> save_watcher;
+    QEventLoop loop;
+    connect(&save_watcher, &QFutureWatcher<FileSys::Nup::PackResult>::finished, &loop,
+            &QEventLoop::quit);
+    save_watcher.setFuture(QtConcurrent::run([path = file_path, update, &error] {
+        try {
+            return FileSys::Nup::UpdateMetadata(path, update, &error);
+        } catch (const std::exception& e) {
+            error = e.what();
+            return FileSys::Nup::PackResult::IoError;
+        }
+    }));
+    if (!save_watcher.isFinished()) {
+        loop.exec(QEventLoop::ExcludeUserInputEvents);
+    }
+    progress.close();
+    const auto res = save_watcher.result();
     if (res != FileSys::Nup::PackResult::Success) {
         if (show_error) {
             QMessageBox::warning(

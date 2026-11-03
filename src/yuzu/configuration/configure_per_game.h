@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <filesystem>
 #include <memory>
 #include <string>
@@ -77,10 +78,27 @@ private:
     void UpdateIconPreview(const QPixmap& map);
     void OnUploadNupIcon();
     void OnDetectNupIcon();
+    void OnDetectNupIconFinished();
+    // Lets the user pick one of several icons; returns the index or -1 if cancelled.
+    int ChooseIcon(const std::vector<std::vector<u8>>& choices);
     bool SaveNupMetadata(bool show_error = false);
 
+    enum class DetectIconStatus {
+        Found,
+        Choices,
+        NotFound,
+        Timeout,
+        NetworkError,
+        Cancelled,
+        NeedsApiKey,
+        BadApiKey,
+        InternalError,
+    };
+
     struct DetectIconResult {
+        DetectIconStatus status{DetectIconStatus::NotFound};
         std::vector<u8> icon_bytes;
+        std::vector<std::vector<u8>> choices;
         std::string resolved_title;
         std::string error;
     };
@@ -94,6 +112,7 @@ private:
     std::vector<u8> pending_nup_icon;
     bool nup_icon_modified{false};
     QFutureWatcher<DetectIconResult> detect_watcher;
+    std::shared_ptr<std::atomic_bool> detect_cancel{std::make_shared<std::atomic_bool>(false)};
 
     QGraphicsScene* scene;
 
