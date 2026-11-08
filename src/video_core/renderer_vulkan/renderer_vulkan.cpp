@@ -212,6 +212,22 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
         render_window.OnFrameDisplayed();
     };
 
+    // A present more than 50 ms after the last one is a stall the player sees (and the game's
+    // audio thread feels); logged with the time so it can be matched to what the game was doing.
+    {
+        using Clock = std::chrono::steady_clock;
+        static Clock::time_point last_present{};
+        const auto now = Clock::now();
+        if (last_present != Clock::time_point{}) {
+            const auto gap_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(now - last_present).count();
+            if (gap_ms > 50) {
+                LOG_WARNING(Render_Vulkan, "Slow frame: {} ms since the previous present", gap_ms);
+            }
+        }
+        last_present = now;
+    }
+
     RenderAppletCaptureLayer(framebuffers);
 
     if (!render_window.IsShown()) {

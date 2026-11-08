@@ -4,6 +4,8 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <cstdlib>
 #include <span>
 #include <vector>
 
@@ -74,6 +76,17 @@ public:
         }
 
         minimum_latency = (std::max)(minimum_latency, TargetSampleCount * 2);
+
+        // The driver's minimum is about 10 ms, which any short stall of the audio thread turns
+        // into a dropout. Output streams get 40 ms by default (EDEN_AUDIO_LATENCY_SAMPLES sets
+        // another figure, 0 keeps the driver's minimum).
+        if (type != StreamType::In) {
+            u32 wanted = TargetSampleCount * 8;
+            if (const char* value = std::getenv("EDEN_AUDIO_LATENCY_SAMPLES")) {
+                wanted = static_cast<u32>(std::strtoul(value, nullptr, 10));
+            }
+            minimum_latency = (std::max)(minimum_latency, wanted);
+        }
 
         LOG_INFO(Service_Audio,
                  "Opening cubeb stream {} type {} with: rate {} channels {} (system channels {}) "

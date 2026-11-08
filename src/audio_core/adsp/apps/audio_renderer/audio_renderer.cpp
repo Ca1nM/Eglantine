@@ -146,6 +146,17 @@ void AudioRenderer::Main(std::stop_token stop_token) {
     // 0.12 seconds (2,304,000 / 19,200,000)
     constexpr u64 max_process_time{2'304'000ULL};
 
+    // Render accounting for the log: how many render requests arrived, how many were cut short by
+    // the time budget (their remaining commands wait for the next request, which sounds like a
+    // dropout), how long a request took at most, and the longest gap between two requests.
+    using LogClock = std::chrono::steady_clock;
+    auto window_start = LogClock::now();
+    auto last_request = window_start;
+    u64 requests{};
+    u64 truncated{};
+    u64 max_taken_us{};
+    u64 max_gap_us{};
+
     while (!stop_token.stop_requested()) {
         auto msg{mailbox.Receive(Direction::DSP)};
         switch (msg) {
@@ -209,6 +220,28 @@ void AudioRenderer::Main(std::stop_token stop_token) {
                     command_buffer.remaining_command_count =
                         command_list_processor.GetRemainingCommandCount();
                     command_buffer.render_time_taken_us = end_time - start_time;
+                    if (command_buffer.remaining_command_count != 0) {
+                        ++truncated;
+                    }
+                    max_taken_us = (std::max)(max_taken_us,
+                                              static_cast<u64>(command_buffer.render_time_taken_us));
+                }
+            }
+            {
+                const auto now = LogClock::now();
+                ++requests;
+                max_gap_us = (std::max)(
+                    max_gap_us, static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                                     now - last_request)
+                                                     .count()));
+                last_request = now;
+                if (now - window_start >= std::chrono::seconds{5}) {
+                    LOG_INFO(Service_Audio,
+                             "Audio renderer: {} render requests in 5 s, {} cut short by the time "
+                             "budget, slowest {} us, longest gap between requests {} us",
+                             requests, truncated, max_taken_us, max_gap_us);
+                    window_start = now;
+                    requests = truncated = max_taken_us = max_gap_us = 0;
                 }
             }
             mailbox.Send(Direction::Host, Message::RenderResponse);

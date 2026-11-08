@@ -190,6 +190,10 @@ void SinkStream::ProcessAudioOutAndRender(std::span<s16> output_buffer, std::siz
 
             if (!queue.TryPop(playing_buffer)) {
                 lk.unlock();
+                // Nothing was queued: the game has not supplied audio in time, and the last frame
+                // is held. Counted per audio thread and logged with the output's totals below.
+                ++underrun_events;
+                underrun_frames += num_frames - frames_written;
                 for (size_t i = frames_written; i < num_frames; i++)
                     std::memcpy(&output_buffer[i * frame_size], last_frame.data(), frame_size_bytes);
                 frames_written = num_frames;
@@ -214,6 +218,51 @@ void SinkStream::ProcessAudioOutAndRender(std::span<s16> output_buffer, std::siz
     }
 
     std::memcpy(last_frame.data(), &output_buffer[(frames_written - 1) * frame_size], frame_size_bytes);
+
+    // Every ~5 seconds of output, say how many times the stream ran dry and for how long, so a
+    // choppy game's audio shows whether the game is late with its buffers or the output is.
+    // Whole chunks of exact silence (the mixer sending nothing) are counted too: they sound like a
+    // dropout without the output ever running dry.
+    {
+        bool chunk_silent = true;
+        for (size_t i = 0; i < num_frames * frame_size; ++i) {
+            if (output_buffer[i] != 0) {
+                chunk_silent = false;
+                break;
+            }
+        }
+        ++callback_count;
+        if (chunk_silent) {
+            ++silent_chunks;
+            silent_run_frames += num_frames;
+            longest_silent_run_frames = std::max(longest_silent_run_frames, silent_run_frames);
+        } else {
+            silent_run_frames = 0;
+        }
+    }
+    played_frames += num_frames;
+    if (played_frames >= TargetSampleRate * 5) {
+        if (silent_chunks != 0) {
+            LOG_INFO(Audio, "Audio output {}: {} of {} chunks were silent (longest run {:.0f} ms) in "
+                            "the last {} frames",
+                     name, silent_chunks, callback_count,
+                     1000.0 * static_cast<double>(longest_silent_run_frames) / TargetSampleRate,
+                     played_frames);
+        }
+        callback_count = 0;
+        silent_chunks = 0;
+        longest_silent_run_frames = 0;
+        if (underrun_events != 0) {
+            LOG_WARNING(Audio, "Audio output ran dry {} times ({} frames, {:.1f} ms) in the last {} "
+                               "frames; {} buffers queued",
+                        underrun_events, underrun_frames,
+                        1000.0 * static_cast<double>(underrun_frames) / TargetSampleRate,
+                        played_frames, queued_buffers.load());
+        }
+        underrun_events = 0;
+        underrun_frames = 0;
+        played_frames = 0;
+    }
 
     // EDEN_NX2_AUDIO_LEVEL: log the output peak about every two seconds (is a game audible?).
     if (static const bool meter = std::getenv("EDEN_NX2_AUDIO_LEVEL") != nullptr; meter) {

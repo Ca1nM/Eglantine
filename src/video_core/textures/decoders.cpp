@@ -4,10 +4,14 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstring>
+#include <future>
 #include <span>
+#include <thread>
+#include <vector>
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -63,11 +67,10 @@ void SwizzleImpl(std::span<u8> output, std::span<const u8> input, u32 width, u32
     const u32 block_depth_mask = (1U << block_depth) - 1;
     const u32 x_shift = GOB_SIZE_SHIFT + block_height + block_depth;
 
-    for (u32 slice = 0; slice < depth; ++slice) {
-        const u32 z = slice + origin_z;
-        const u32 offset_z = (z >> block_depth) * slice_size +
-                             ((z & block_depth_mask) << (GOB_SIZE_SHIFT + block_height));
-        for (u32 line = 0; line < height; ++line) {
+    // Every line reads and writes its own bytes of both buffers, so a range of lines is an
+    // independent job.
+    const auto process_lines = [&](u32 slice, u32 offset_z, u32 line_begin, u32 line_end) {
+        for (u32 line = line_begin; line < line_end; ++line) {
             const u32 y = line + origin_y;
             const u32 swizzled_y = pdep<SWIZZLE_Y_BITS>(y);
 
@@ -92,6 +95,40 @@ void SwizzleImpl(std::span<u8> output, std::span<const u8> input, u32 width, u32
 
                 std::memcpy(dst, src, BYTES_PER_PIXEL);
             }
+        }
+    };
+
+    // Large single-slice images (movie frames: a 1080p RGBA frame is 8 MiB, swizzled on one core
+    // for every frame) are split over several threads; anything smaller is not worth the
+    // hand-off and runs on the calling thread as before.
+    constexpr u64 ParallelMinBytes = u64{4} << 20;
+    const u32 worker_count = (std::min)(8U, (std::max)(1U, std::thread::hardware_concurrency()));
+    const bool parallel = depth == 1 && worker_count > 1 && height >= 64 &&
+                          u64{width} * height * BYTES_PER_PIXEL >= ParallelMinBytes;
+
+    for (u32 slice = 0; slice < depth; ++slice) {
+        const u32 z = slice + origin_z;
+        const u32 offset_z = (z >> block_depth) * slice_size +
+                             ((z & block_depth_mask) << (GOB_SIZE_SHIFT + block_height));
+        if (!parallel) {
+            process_lines(slice, offset_z, 0, height);
+            continue;
+        }
+        // Chunks are whole GOB rows (8 lines) so no two threads touch the same GOB.
+        const u32 rows = (height + 7) / 8;
+        const u32 rows_per_worker = (rows + worker_count - 1) / worker_count;
+        std::vector<std::future<void>> jobs;
+        for (u32 worker = 1; worker < worker_count; ++worker) {
+            const u32 begin = (std::min)(height, worker * rows_per_worker * 8);
+            const u32 end = (std::min)(height, (worker + 1) * rows_per_worker * 8);
+            if (begin < end) {
+                jobs.push_back(std::async(std::launch::async, process_lines, slice, offset_z,
+                                          begin, end));
+            }
+        }
+        process_lines(slice, offset_z, 0, (std::min)(height, rows_per_worker * 8));
+        for (auto& job : jobs) {
+            job.get();
         }
     }
 }
